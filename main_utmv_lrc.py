@@ -1,0 +1,364 @@
+import math, shutil, os, time, argparse
+import numpy as np
+import scipy.io as sio
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim
+import torch.utils.data
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+
+from lib.datasets import WLP,AFLW,BIWI,UTMULTIVIEW,MPIIGAZE
+from lib.models import HPNet,HGNet_G,GNet,GNet_BL,GNet_VIT,GNet_BIAS,GNet_LR,GNet_LRC
+from lib.utils.loss import PYRCELoss, PYRMSELoss,PYROrdinalLoss,PYRMSELoss_BL,PYRMSELoss_LR,PYRMSELoss_LRC
+
+from PIL import Image
+import cv2
+
+from scipy import stats
+
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def convert_to_unit_vector(angles):
+    pitches = angles[:, 0]*np.pi/180
+    yaws = angles[:, 1]*np.pi/180
+    x = -torch.cos(pitches) * torch.sin(yaws)
+    y = -torch.sin(pitches)
+    z = -torch.cos(pitches) * torch.cos(yaws)
+    norm = torch.sqrt(x**2 + y**2 + z**2)
+    x /= norm
+    y /= norm
+    z /= norm
+    return x, y, z
+
+def compute_angle_error(predictions,labels):
+    pred_x, pred_y, pred_z = convert_to_unit_vector(predictions)
+    label_x, label_y, label_z = convert_to_unit_vector(labels)
+    angles = pred_x * label_x + pred_y * label_y + pred_z * label_z
+    return torch.acos(angles) * 180 / np.pi
+
+
+parser = argparse.ArgumentParser(description='opendriver-pytorch-Trainer.')
+parser.add_argument('--sink', type=str2bool, nargs='?', const=False, default=False, help="Just sink and terminate.")
+parser.add_argument('--reset', type=str2bool, nargs='?', const=False, default=True, help="Start from scratch (do not load).")
+args = parser.parse_args()
+
+# Change there flags to control what happens.
+doLoad = not args.reset # Load checkpoint at the beginning
+doTest = args.sink # Only run test, no training
+
+workers = 32
+epochs = 40
+batch_size=16
+
+base_lr = 0.00001
+momentum = 0.9
+weight_decay = 1e-4
+print_freq = 10
+prec1 = 0
+best_prec1 = 7.0
+lr = base_lr
+
+count_test = 0
+count = 0
+
+CHECKPOINTS_PATH = './output/gaze/utmv_lrc'
+
+
+def main():
+    global args, best_prec1, weight_decay, momentum
+    
+    os.environ['CUDA_VISIBLE_DEVICES']='1'
+    cudnn.benchmark = True 
+    
+    model = GNet_LRC(cls_num=108)
+    optimizer = torch.optim.Adam(model.parameters(), lr,
+                                #momentum=momentum,
+                                weight_decay=weight_decay)
+
+    
+    criterion = PYRMSELoss_LRC(cls_num=108,f_dim=1280).cuda()
+    model = torch.nn.DataParallel(model).cuda()
+    
+    imSize=(224,224)
+
+    epoch = 0
+    if doLoad:
+        saved = load_checkpoint()
+        if saved:
+            print('Loading checkpoint for epoch %05d with loss %.5f ...' % (saved['epoch'], saved['best_prec1']))
+            state = saved['state_dict']
+            try:
+                model.module.load_state_dict(state,strict=True)
+            except:
+                model.load_state_dict(state,strict=True)
+            
+            epoch = saved['epoch']
+            best_prec1 = saved['best_prec1']
+            #print(best_prec1)
+        else:
+            print('Warning: Could not read checkpoint!')
+    
+    dataTrain = UTMULTIVIEW(split='train', aug = True)
+    dataVal = UTMULTIVIEW(split='test', aug = False)
+    
+    train_loader = torch.utils.data.DataLoader(
+        dataTrain,
+        batch_size=batch_size, shuffle=True,
+        num_workers=workers, pin_memory=True)
+
+    val_loader = torch.utils.data.DataLoader(
+        dataVal,
+        batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True)
+    
+    # Quick test
+    if doTest:
+        validate(val_loader, model, criterion, epoch)
+        return
+
+
+    for epoch in range(0, epoch):
+        adjust_learning_rate(optimizer, epoch)
+        
+    for epoch in range(epoch, epochs):
+        adjust_learning_rate(optimizer, epoch)
+
+        # train for one epoch
+        train(train_loader, model, criterion, optimizer, epoch)
+        
+        # evaluate on validation set
+        prec1 = validate(val_loader, model, criterion, epoch)
+
+        # remember best prec@1 and save checkpoint
+        is_best = prec1 < best_prec1
+        best_prec1 = min(prec1, best_prec1)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+        }, is_best)
+
+
+def train(train_loader, model, criterion,optimizer, epoch):
+    global count
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+
+    for i, (imFace_L,imFace_R,gaze_l,gaze_r,g_l_b,g_r_b,g_l_mp,g_r_mp) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+        imFace_L = imFace_L.cuda()
+        imFace_R = imFace_R.cuda()
+        gaze_l = gaze_l.cuda()
+        gaze_r = gaze_r.cuda()
+        g_l_b=g_l_b.cuda()
+        g_r_b=g_r_b.cuda()
+        g_l_mp=g_l_mp.cuda()
+        g_r_mp=g_r_mp.cuda()
+        
+        # compute output
+        output_l,output_r,out_l_b,out_r_b,out_l_mp,out_r_mp,out_l_f,out_r_f= model(imFace_L,imFace_R)
+
+        loss = criterion(output_l,gaze_l,output_r,gaze_r,out_l_b,g_l_b,out_r_b,g_r_b,out_l_mp,g_l_mp,out_r_mp,g_r_mp,out_l_f,out_r_f)
+        losses.update(loss.data.item(), imFace_L.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        count=count+1
+        
+        if i%100==0: 
+            print('Epoch (train): [{0}][{1}/{2}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                       epoch, i, len(train_loader), batch_time=batch_time,
+                       data_time=data_time, loss=losses))
+
+        #loss_file.writelines('%03f/%03f '%(losses.val,losses.avg))
+    #loss_file.close()
+
+def validate(val_loader, model, criterion, epoch):
+    global count_test
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    lossesLin = AverageMeter()
+    lossesLin_L = AverageMeter()
+    lossesLin_R = AverageMeter()
+    
+    lossesLin_LP=AverageMeter()
+    lossesLin_LY=AverageMeter()
+    lossesLin_RP=AverageMeter()
+    lossesLin_RY=AverageMeter()
+    
+    # switch to evaluate mode
+    model.eval()
+    end = time.time()
+
+    #idx_tensor = torch.arange(66).cuda()
+    softmax=nn.Softmax(dim=2).cuda()
+
+    
+    for i, (imFace_L,imFace_R,gaze_l,gaze_r,g_l_b,g_r_b,g_l_mp,g_r_mp) in enumerate(val_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+        imFace_L = imFace_L.cuda()
+        imFace_R = imFace_R.cuda()
+        gaze_l = gaze_l.cuda()
+        gaze_r = gaze_r.cuda()
+        g_l_b=g_l_b.cuda()
+        g_r_b=g_r_b.cuda()
+        g_l_mp=g_l_mp.cuda()
+        g_r_mp=g_r_mp.cuda()
+        
+
+        # compute output
+        with torch.no_grad():
+            output_l,output_r,out_l_b,out_r_b,out_l_mp,out_r_mp,out_l_f,out_r_f= model(imFace_L,imFace_R)
+
+        loss = criterion(output_l,gaze_l,output_r,gaze_r,out_l_b,g_l_b,out_r_b,g_r_b,out_l_mp,g_l_mp,out_r_mp,g_r_mp,out_l_f,out_r_f)
+        
+        #calculate the prediction
+        pred_l=softmax(out_l_b)
+        pred_l=torch.argmax(pred_l,dim=2)
+        pred_l=pred_l*1+0.5
+        
+        pred_r=softmax(out_r_b)
+        pred_r=torch.argmax(pred_r,dim=2)
+        pred_r=pred_r*1+0.5
+        
+        output_l=(output_l+pred_l)/2
+        output_r=(output_r+pred_r)/2
+        
+        lossLin_L=torch.mean(torch.abs(output_l-gaze_l),dim=0)
+        lossLin_LP=lossLin_L[0]
+        lossLin_LY=lossLin_L[1]
+        lossLin_R=torch.mean(torch.abs(output_r-gaze_r),dim=0)
+        lossLin_RP=lossLin_R[0]
+        lossLin_RY=lossLin_R[1]
+        
+        lossesLin_LP.update(lossLin_LP.data.item(), output_l.size(0))
+        lossesLin_LY.update(lossLin_LY.data.item(), output_l.size(0))
+        lossesLin_RP.update(lossLin_RP.data.item(), output_l.size(0))
+        lossesLin_RY.update(lossLin_RY.data.item(), output_l.size(0))
+        
+        #print(diff_w)
+        output=(output_r+output_l)/2
+        output_l=output
+        output_r=output
+        
+        output_l=(output_l-54)*1
+        output_r=(output_r-54)*1
+        gt_l=(gaze_l-54)*1
+        gt_r=(gaze_r-54)*1
+        
+        
+        lossLin_L=compute_angle_error(output_l,gt_l)
+        #lossLin_L[torch.isnan(lossLin_L)] = 3
+        lossLin_L=torch.mean(lossLin_L)
+        
+        lossLin_R=compute_angle_error(output_r,gt_r)
+        #lossLin_R[torch.isnan(lossLin_R)] = 3
+        lossLin_R=torch.mean(lossLin_R)
+        
+        lossLin=(lossLin_L+lossLin_R)/2
+        
+        losses.update(loss.data.item(), output_l.size(0))
+        lossesLin_L.update(lossLin_L.item(), output_l.size(0))
+        lossesLin_R.update(lossLin_R.item(), output_l.size(0))
+        lossesLin.update(lossLin.item(), output_l.size(0))
+     
+        # compute gradient and do SGD step
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        
+        if i%100==0:
+
+            print('Epoch (val): [{0}][{1}/{2}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Error L2 {lossLin.val:.4f} ({lossLin.avg:.4f})\t'.format(
+                        epoch, i, len(val_loader), batch_time=batch_time,
+                       loss=losses,lossLin=lossesLin))
+    print(lossesLin_L.avg)
+    print(lossesLin_R.avg)
+    print(lossesLin.avg)
+
+    return lossesLin.avg
+
+
+def load_checkpoint(filename='best_checkpoint.pth.tar'):
+    filename = os.path.join(CHECKPOINTS_PATH, filename)
+    print(filename)
+    if not os.path.isfile(filename):
+        return None
+    state = torch.load(filename)
+    return state
+
+
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    if not os.path.isdir(CHECKPOINTS_PATH):
+        os.makedirs(CHECKPOINTS_PATH, 0o777)
+    bestFilename = os.path.join(CHECKPOINTS_PATH, 'best_' + filename)
+    filename = os.path.join(CHECKPOINTS_PATH, filename)
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, bestFilename)
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = base_lr * (0.1 ** (epoch // 30))
+    for param_group in optimizer.state_dict()['param_groups']:
+        param_group['lr'] = lr
+
+
+if __name__ == "__main__":
+    
+    main()
+    print('DONE')
